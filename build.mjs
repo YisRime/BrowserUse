@@ -12,7 +12,7 @@ function manifest() {
     manifest_version: 3,
     name: "BrowserUse",
     description: "A Browser Bridge for MCP Clients",
-    version: '1.0.0',
+    version: '1.1.4',
     author: "Yis_Rime (https://github.com/YisRime)",
     homepage_url: "https://github.com/YisRime/BrowserUse",
     key: MANIFEST_KEY,

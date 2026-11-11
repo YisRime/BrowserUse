@@ -1,6 +1,6 @@
 import { attachedTabs, browserLabel, watchTabs, setConnection, setEmitter } from "./browser";
 import { watchDebugger } from "./cdp";
-import { watchTabUrls, methods } from "./page";
+import { watchTabUrls, methods, debugLog } from "./page";
 import { DEFAULT_PORT, HostError, PROTOCOL_VERSION } from "./protocol";
 import type { Frame } from "./protocol";
 let socket: WebSocket | null = null;
@@ -80,6 +80,7 @@ async function onFrame(candidate: WebSocket, raw: string): Promise<void> {
     return;
   }
   if (frame.t !== "req") return;
+  void debugLog(`frame ${frame.method}`);
   let response: Frame;
   try {
     const handler = (methods as Record<string, (params: Record<string, unknown>) => Promise<unknown>>)[frame.method];
@@ -105,6 +106,17 @@ export default function main(): void {
   chrome.alarms.create("browseruse-keepalive", { periodInMinutes: 0.5 });
   chrome.alarms.onAlarm.addListener(() => {
     if (!socket) void connect();
+  });
+  // 端口变更立即重连（set_bridge_port 写入 storage 后无需等待重试周期）
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local" || !changes["browseruse.port"]) return;
+    if (socket) {
+      const closing = socket;
+      socket = null;
+      closing.close();
+    } else {
+      void connect();
+    }
   });
   void connect();
 }

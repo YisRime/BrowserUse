@@ -43,6 +43,8 @@ export function parseUid(uid: unknown): { snapshotSeq: number; index: number } |
 export type Method =
   | "status"
   | "set_bridge_port"
+  | "create_page"
+  | "close_page"
   | "save_page"
   | "list_pages"
   | "select_page"
@@ -82,7 +84,7 @@ export type Frame =
   | { t: "ping"; at: number }
   | { t: "pong"; at: number };
 export type PageInfo = { pageId: number; url: string; title: string; active: boolean; attached: boolean; selected: boolean };
-export type StatusResult = { protocol: number; extensionVersion: string; browser: string; selectedPageId: number | null; attachedTabs: number[]; pages: PageInfo[] };
+export type StatusResult = { protocol: number; extensionVersion: string; browser: string; selectedPageId: number | null; attachedTabs: number[]; pages: PageInfo[]; debugLog?: string[]; bootAt?: string };
 export function num(params: Params, key: string): number;
 export function num(params: Params, key: string, fallback: number | null): number | null;
 // 读取数值

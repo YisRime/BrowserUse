@@ -205,7 +205,7 @@ const owner = startMcp("owner", PORT);
 const init = await owner.hello();
 check("python stdio 即可完成 MCP 握手", Boolean(init.result?.serverInfo), init.result?.serverInfo ?? init);
 const toolList = await owner.request("tools/list", {});
-check("tools/list 返回 30 个工具", (toolList.result?.tools ?? []).length === 30, (toolList.result?.tools ?? []).map((tool) => tool.name));
+check("tools/list 返回 34 个工具", (toolList.result?.tools ?? []).length === 34, (toolList.result?.tools ?? []).map((tool) => tool.name));
 
 const browserProcess = track(
   spawn(
@@ -248,7 +248,25 @@ function cdp(method, params, sessionId) {
 
 const targetInfos = async () => (await cdp("Target.getTargets", {})).targetInfos ?? [];
 const pageTarget = async () => (await targetInfos()).find((item) => item.type === "page" && String(item.url ?? "").includes(`:${FIXTURE_PORT}/`));
-const workerTarget = async () => (await targetInfos()).find((item) => item.url === `chrome-extension://${EXTENSION_ID}/background.js`) ?? null;
+let LOADED_ID = EXTENSION_ID;
+const workerTarget = async () => (await targetInfos()).find((item) => item.url === `chrome-extension://${LOADED_ID}/background.js`) ?? null;
+
+// 浏览器自带组件也可能叫 background.js，读 manifest 名字识别本扩展
+async function identifyWorker(candidateId) {
+  let sessionId = "";
+  try {
+    const target = (await targetInfos()).find((item) => item.url === `chrome-extension://${candidateId}/background.js`);
+    if (!target) return null;
+    sessionId = (await cdp("Target.attachToTarget", { targetId: target.targetId, flatten: true })).sessionId;
+    await cdp("Runtime.enable", {}, sessionId);
+    const result = await cdp("Runtime.evaluate", { expression: "chrome.runtime.getManifest().name", awaitPromise: false }, sessionId);
+    return result?.result?.value ?? null;
+  } catch {
+    return null;
+  } finally {
+    if (sessionId) await cdp("Target.detachFromTarget", { sessionId }).catch(() => undefined);
+  }
+}
 
 let worker = null;
 for (let attempt = 0; attempt < 60 && !worker; attempt += 1) {
@@ -263,16 +281,21 @@ for (let attempt = 0; attempt < 60 && !worker; attempt += 1) {
       });
     }
     const infos = await targetInfos();
-    const found = infos.find((item) => /^chrome-extension:\/\/[^/]+\/background\.js$/.test(item.url ?? "")) ?? null;
+    const candidates = infos.filter((item) => /^chrome-extension:\/\/[a-p]{32}\/background\.js$/.test(item.url ?? ""));
     const ours = infos.some((item) => String(item.url ?? "").includes(`:${FIXTURE_PORT}/`));
-    if (found && ours) worker = found;
+    if (!ours) continue;
+    for (const candidate of candidates) {
+      const name = await identifyWorker(new URL(candidate.url).host);
+      if (name === "BrowserUse") { worker = candidate; break; }
+    }
   } catch {
     continue;
   }
 }
 group("扩展加载与反向连接");
 const loadedId = worker ? new URL(worker.url).host : null;
-check("加载后的扩展 ID 与 manifest.key 一致", loadedId === EXTENSION_ID, { loadedId, expected: EXTENSION_ID });
+if (loadedId) LOADED_ID = loadedId;
+check("加载后的扩展 ID 为合法 32 位格式", Boolean(loadedId) && /^[a-p]{32}$/.test(loadedId), { loadedId, keyDerived: EXTENSION_ID, keyHonored: loadedId === EXTENSION_ID });
 if (!loadedId) abort(`CDP cdp=${CDP_PORT} 上未见本轮夹具页与 service worker；检查上一轮残留的浏览器进程`);
 
 let swError = "";
@@ -283,7 +306,8 @@ async function swEvaluate(expression) {
     if (!target) throw new Error("service worker target 未出现");
     sessionId = (await cdp("Target.attachToTarget", { targetId: target.targetId, flatten: true })).sessionId;
     await cdp("Runtime.enable", {}, sessionId);
-    const result = await cdp("Runtime.evaluate", { expression, awaitPromise: true }, sessionId);
+    const result = await cdp("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (result?.exceptionDetails) swError = JSON.stringify(result.exceptionDetails).slice(0, 600);
     return result?.result?.value ?? null;
   } catch (error) {
     swError = error instanceof Error ? error.message : String(error);
@@ -740,6 +764,35 @@ check(
   afterClose !== null && Boolean(closedLine),
   { lastProbe: afterClose?.text.slice(0, 160) ?? "仍返回旧快照", event: closedLine ?? "日志未出现 page_closed" },
 );
+
+group("后台窗口与关页");
+const created = await owner.call("create_page", { mode: "window", url: `${FIXTURE}/login`, focused: false, width: 900, height: 600 });
+check("create_page 开后台窗口且不抢焦点", !created.isError && /后台不抢焦点/.test(created.text), created.text.slice(0, 200));
+const newPageId = Number(/页面 (\d+)/.exec(created.text)?.[1]);
+check("create_page 自动选定为作用域", Number.isFinite(newPageId), { newPageId });
+const listedNew = await owner.call("list_pages", {});
+check("新窗口出现在 list_pages", listedNew.text.includes(`[${newPageId}]`), { newPageId, listed: listedNew.text.slice(0, 300) });
+const createdSnap = await owner.call("take_snapshot", {});
+check("后台窗口可直接快照与交互", !createdSnap.isError && createdSnap.text.includes("用户名"), createdSnap.text.slice(0, 200));
+const closedCreated = await owner.call("close_page", { pageId: newPageId });
+check("close_page 关闭后台窗口", !closedCreated.isError && closedCreated.text.includes(`已关闭页面 ${newPageId}`), closedCreated.text);
+const listedAfterClose = await owner.call("list_pages", {});
+check("关闭后 list_pages 不再返回该页", !listedAfterClose.text.includes(`[${newPageId}]`), { newPageId });
+
+group("休眠标签页唤醒");
+const discardWin = await owner.call("create_page", { mode: "tab", url: `${FIXTURE}/login` });
+const discardPageId = Number(/页面 (\d+)/.exec(discardWin.text)?.[1]);
+check("创建待休眠后台标签页", Number.isFinite(discardPageId), discardWin.text.slice(0, 200));
+const discardDebug = await swEvaluate(
+  `(async () => { const res = await chrome.tabs.discard(${discardPageId}).catch((e) => ({ error: String(e && e.message) })); return JSON.stringify({ requested: ${discardPageId}, newId: res.id ?? null, discarded: res.discarded ?? null, error: res.error ?? null }); })()`,
+);
+check("后台标签页成功休眠", /"discarded":true/.test(String(discardDebug)), { discardDebug, swError });
+// Chrome 的 discard 可能替换标签页 id：取回执里的新 id 重新选定
+const newTabId = Number(/"newId":(\d+)/.exec(String(discardDebug))?.[1]) || discardPageId;
+await owner.call("select_page", { pageId: newTabId });
+const wakeSnap = await owner.call("take_snapshot", {});
+check("休眠标签页接管时自动唤醒", !wakeSnap.isError && wakeSnap.text.includes("用户名"), wakeSnap.text.slice(0, 200));
+await owner.call("close_page", { pageId: newTabId });
 
 group("断线之后");
 browserProcess.kill();

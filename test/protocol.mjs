@@ -201,6 +201,10 @@ const canned = {
         : { action: "wait", waitedMs: 900, download: { id: 7, filename: "C:/tmp/report.csv", state: "complete", totalBytes: 2048, bytesReceived: 2048 } },
   save_page: () => ({ pageId: 42, url: "https://example.com/", title: "Example Domain", bytes: 1_800, mhtml: "MIME-Version: 1.0\r\nSubject: x\r\n\r\n<html></html>" }),
   set_bridge_port: (params) => (params.port ? { previous: 8712, port: params.port, connected: true, endpoint: "ws://127.0.0.1:8712/" } : { port: 8712, defaultPort: 8712, connected: true, endpoint: "ws://127.0.0.1:8712/" }),
+  create_page: (params) => ({ mode: params.mode ?? "window", pageId: 88, windowId: 7, url: params.url ?? "about:blank", title: "", incognito: params.incognito === true, focused: params.focused === true, type: params.type ?? "popup" }),
+  close_page: (params) => ({ closed: params.pageId ?? 42, url: "https://example.com/" }),
+  status: () => ({ protocol: PROTOCOL_VERSION, extensionVersion: "0.3.0-test", browser: "edge", selectedPageId: 42, attachedTabs: [42], pages: [page()], debugLog: ["frame fill"], bootAt: "2026-01-01T00:00:00.000Z" }),
+  detach: () => ({ detached: [42] }),
   list_network_requests: () => ({
     pageId: 42,
     total: 2,
@@ -210,7 +214,7 @@ const canned = {
   list_console_messages: () => ({ pageId: 42, total: 1, pageIdx: 0, page: [{ type: "log", text: "控制台标记 ALPHA", timestamp: 1_000, source: "https://example.com/a.js", line: 12, world: "content.js" }] }),
 };
 const failing = { hover: { code: "stale_snapshot", message: "uid 3_1 属于旧快照，重新 take_snapshot", retryable: true } };
-const TOOLS = Object.keys(canned).filter((name) => name !== "status");
+const TOOLS = Object.keys(canned);
 
 group("握手与工具表");
 const owner = startMcp("owner", PORT);
@@ -245,8 +249,8 @@ check(
 const METHODS = [...(/export type Method =([\s\S]*?);/.exec(SOURCE)?.[1] ?? "").matchAll(/"([a-z_]+)"/g)].map((match) => match[1]);
 const internal = METHODS.filter((name) => !names.includes(name));
 check(
-  "工具表与 TS 方法表只差 status 与 detach",
-  JSON.stringify(internal) === '["status","detach"]' && TOOLS.every((name) => names.includes(name)),
+  "工具表与 TS 方法表完全一致（status/detach 已注册为正式工具）",
+  internal.length === 0 && TOOLS.every((name) => names.includes(name)),
   { internal, count: names.length, extra: names.filter((name) => !TOOLS.includes(name)) },
 );
 
@@ -455,14 +459,36 @@ check("并发时扩展同一时刻只收到一条指令", activity.maxConcurrent
 check("两个会话各自取回结果", a.text.includes("已填充 7_1（4 个字符）") && b.text.includes("已按下 Control+A"), { a: a.text, b: b.text });
 check("两条会话的请求均送达扩展", new Set(seen.map((entry) => entry.method)).size === 2, seen.map((entry) => entry.method));
 
-group("Origin 白名单");
-const impersonator = new WebSocket(`ws://127.0.0.1:${PORT}/`, { headers: { Origin: "chrome-extension://anotherextensionid" } });
-const rejected = await new Promise((resolve) => {
-  impersonator.addEventListener("error", () => resolve(true));
-  impersonator.addEventListener("open", () => resolve(false));
+group("Origin 校验");
+// 网页等非扩展来源一律拒绝
+const webOrigin = new WebSocket(`ws://127.0.0.1:${PORT}/`, { headers: { Origin: "https://evil.example" } });
+const webRejected = await new Promise((resolve) => {
+  webOrigin.addEventListener("error", () => resolve(true));
+  webOrigin.addEventListener("open", () => resolve(false));
   setTimeout(() => resolve(null), 3_000);
 });
-check("其它扩展 ID 冒充接入被拒", rejected === true, { rejected });
+check("网页等非扩展来源接入被拒", webRejected === true, { webRejected });
+// 默认接受任意 chrome-extension:// 来源（未打包扩展的实际 ID 随浏览器可能偏离 manifest.key 推导值）
+const impersonator = new WebSocket(`ws://127.0.0.1:${PORT}/`, { headers: { Origin: "chrome-extension://anotherextensionid" } });
+const accepted = await new Promise((resolve) => {
+  impersonator.addEventListener("open", () => resolve(true));
+  impersonator.addEventListener("error", () => resolve(false));
+  setTimeout(() => resolve(null), 3_000);
+});
+impersonator.close();
+check("默认接受任意 chrome-extension:// 来源", accepted === true, { accepted });
+// 指定 --extension-id 后，其它扩展 ID 冒充被拒
+const pinnedPort = PORT + 977;
+const pinned = spawn("python", ["browseruse.py", "--port", String(pinnedPort), "--extension-id", EXTENSION_ID, "--serve-only"], { stdio: "ignore" });
+await new Promise((resolve) => setTimeout(resolve, 1_500));
+const pinnedImpostor = new WebSocket(`ws://127.0.0.1:${pinnedPort}/`, { headers: { Origin: "chrome-extension://anotherextensionid" } });
+const pinnedRejected = await new Promise((resolve) => {
+  pinnedImpostor.addEventListener("error", () => resolve(true));
+  pinnedImpostor.addEventListener("open", () => resolve(false));
+  setTimeout(() => resolve(null), 3_000);
+});
+check("指定 --extension-id 时其它扩展 ID 冒充接入被拒", pinnedRejected === true, { pinnedRejected });
+pinned.kill();
 
 group("扩展事件");
 extension.send(JSON.stringify({ t: "evt", name: "snapshot_invalidated", payload: { pageId: 42, reason: "tab_url_changed", retired: 3 } }));

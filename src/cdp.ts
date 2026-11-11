@@ -102,13 +102,45 @@ export async function cdp<T = Record<string, unknown>>(
     if (!aborts.size) inFlight.delete(tabId);
   }
 }
+// 唤醒休眠标签页：Auto Tab Discard 等丢弃标签页后渲染器不存在，直接 attach 后所有 CDP 域调用都会挂起
+function wakeTab(tabId: number, timeoutMs = 20_000): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    let settled = false;
+    const finish = (error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timer);
+      if (error) rejectPromise(error);
+      else resolvePromise();
+    };
+    type Listener = Parameters<typeof chrome.tabs.onUpdated.addListener>[0];
+    const listener: Listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId !== tabId) return;
+      if (changeInfo.status === "complete") finish();
+    };
+    const timer = setTimeout(() => finish(new HostError("timeout", `休眠标签页 ${tabId} 唤醒超时`, true)), timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.reload(tabId)
+      .then(() => chrome.tabs.get(tabId))
+      .then((fresh) => {
+        if (fresh.status === "complete") finish();
+      })
+      .catch(() => finish(new HostError("cdp_failed", `唤醒休眠标签页 ${tabId} 失败`, true)));
+  });
+}
 // 确保接管
 export async function ensureAttached(tabId: number): Promise<void> {
   if (isAttached(tabId)) return;
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) throw new HostError("page_gone", `页面 ${tabId} 已不存在，请重新 list_pages`, true);
-  if (["chrome://", "edge://", "devtools://", "view-source:", "about:"].some((prefix) => (tab.url ?? "").startsWith(prefix))) {
-    throw new HostError("attach_blocked", `无法接管 ${tab.url ?? "该页面"}；请改用普通 http(s) 页面`);
+  const url = tab.url ?? "";
+  const internal = ["chrome://", "edge://", "devtools://", "view-source:", "chrome-extension://"].some((prefix) => url.startsWith(prefix)) || (url.startsWith("about:") && !/^about:blank([?#]|$)/.test(url));
+  if (internal) {
+    throw new HostError("attach_blocked", `无法接管 ${url || "该页面"}（内部/扩展页面，常见于标签页休眠扩展的占位页）；对 navigate_page 传 type=url 可跳转回普通页面`, true);
+  }
+  if (tab.discarded === true || tab.status === "unloaded") {
+    await wakeTab(tabId);
   }
   try {
     await chrome.debugger.attach({ tabId }, "1.3");
@@ -774,14 +806,15 @@ export async function stopTrace(tabId: number): Promise<Record<string, unknown>>
 // 截取画面
 export async function captureScreenshot(
   tabId: number,
-  options: { format: string; quality: number | null; fullPage: boolean; clip?: { x: number; y: number; width: number; height: number } | null },
+  options: { format: string; quality: number | null; fullPage: boolean; clip?: { x: number; y: number; width: number; height: number } | null; fromSurface?: boolean; timeoutMs?: number },
 ): Promise<string> {
   await ensureAttached(tabId);
   const params: Record<string, unknown> = { format: options.format };
   if (options.format !== "png" && options.quality !== null) params.quality = options.quality;
   if (options.clip) params.clip = { ...options.clip, scale: 1 };
   else if (options.fullPage) params.captureBeyondViewport = true;
-  const response = await cdp<{ data?: string }>(tabId, "Page.captureScreenshot", params);
+  if (options.fromSurface !== undefined) params.fromSurface = options.fromSurface;
+  const response = await cdp<{ data?: string }>(tabId, "Page.captureScreenshot", params, options.timeoutMs ?? 20_000);
   if (!response.data) throw new HostError("cdp_failed", "Page.captureScreenshot 未返回数据", true);
   return response.data;
 }

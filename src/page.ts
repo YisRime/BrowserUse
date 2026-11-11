@@ -197,13 +197,37 @@ function paging<T>(entries: T[], params: Params): { page: T[]; total: number } {
   return { page: entries.slice(start, start + pageSize), total: entries.length };
 }
 type Handler = (params: Params) => Promise<unknown>;
+// 调试环形缓冲：写入 chrome.storage.session（SW 被冻结/重启后仍可读），由 status 工具读出
+const DEBUG_LIMIT = 60;
+const DEBUG_KEY = "browseruse.debuglog";
+export const BOOT_AT = Date.now();
+export async function debugLog(message: string): Promise<void> {
+  const line = `${new Date().toISOString().slice(11, 23)} ${message}`;
+  try {
+    const got = await chrome.storage.session.get(DEBUG_KEY);
+    const buffer: string[] = Array.isArray(got[DEBUG_KEY]) ? got[DEBUG_KEY] : [];
+    buffer.push(line);
+    while (buffer.length > DEBUG_LIMIT) buffer.shift();
+    await chrome.storage.session.set({ [DEBUG_KEY]: buffer });
+  } catch {
+    // session 存储不可用时退回 console
+  }
+  console.debug("[browseruse]", line);
+}
 export const methods: Record<Method, Handler> = {
   // 汇报状态
   async status(): Promise<StatusResult> {
     const pages = await listPages();
+    let log: string[] = [];
+    try {
+      const got = await chrome.storage.session.get(DEBUG_KEY);
+      if (Array.isArray(got[DEBUG_KEY])) log = got[DEBUG_KEY];
+    } catch {
+      // 忽略
+    }
     return {
       protocol: PROTOCOL_VERSION, extensionVersion: chrome.runtime.getManifest().version, browser: browserLabel(), selectedPageId: pages.find((page) => page.selected)?.pageId ?? null,
-      attachedTabs: attachedTabs(), pages,
+      attachedTabs: attachedTabs(), pages, debugLog: log, bootAt: new Date(BOOT_AT).toISOString(),
     };
   },
   // 保存归档
@@ -225,6 +249,44 @@ export const methods: Record<Method, Handler> = {
     if (port < 1024 || port > 65535) throw new HostError("bad_request", `端口需在 1024–65535 之间，实际为 ${port}`);
     await chrome.storage.local.set({ "browseruse.port": port });
     return { previous: current, port, ...connectionState() };
+  },
+  // 新建页面
+  async create_page(params) {
+    const mode = choice(params, "mode", ["window", "tab"], "window");
+    const url = str(params, "url", "about:blank") as string;
+    if (mode === "tab") {
+      const tab = await chrome.tabs.create({ url, active: bool(params, "active", false) });
+      select(tab.id as number);
+      return { mode, pageId: tab.id, windowId: tab.windowId, url: tab.url ?? url, title: tab.title ?? "", focused: bool(params, "active", false) };
+    }
+    // 普通浏览器新窗口（非 popup、非无痕），focused=false 时后台打开不抢焦点
+    const createData: chrome.windows.CreateData = { url, focused: bool(params, "focused", false) };
+    for (const key of ["left", "top", "width", "height"] as const) {
+      const value = num(params, key, null);
+      if (value !== null) createData[key] = Math.trunc(value);
+    }
+    const win = await chrome.windows.create(createData);
+    let tab = win?.tabs?.[0];
+    if (!tab?.id && win?.id !== undefined) {
+      // 窗口创建回执可能未携带 tabs：回查一次
+      await settle(250);
+      tab = (await chrome.windows.get(win.id, { populate: true }).catch(() => null))?.tabs?.[0];
+    }
+    if (!tab?.id) throw new HostError("cdp_failed", "窗口创建成功但未返回标签页", true);
+    select(tab.id as number);
+    return {
+      mode, pageId: tab.id, windowId: win.id, url: tab.url ?? url, title: tab.title ?? "", focused: win.focused === true,
+    };
+  },
+  // 关闭页面
+  async close_page(params) {
+    const explicit = num(params, "pageId", null);
+    const tabId = explicit !== null ? Math.trunc(explicit) : (await listPages()).find((page) => page.selected)?.pageId ?? null;
+    if (tabId === null) throw new HostError("no_page", "没有可选定页面：先 list_pages，再由 select_page 选定或向 close_page 传 pageId", true);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) throw new HostError("page_gone", `页面 ${tabId} 已不存在，请重新 list_pages`, true);
+    await chrome.tabs.remove(tabId);
+    return { closed: tabId, url: tab.url ?? "" };
   },
   // 列出标签
   async list_pages(params) {
@@ -248,8 +310,11 @@ export const methods: Record<Method, Handler> = {
     const kind = choice(params, "type", ["url", "back", "forward", "reload"], "url");
     const timeoutMs = num(params, "timeout", 20_000) as number;
     const initScript = str(params, "initScript", null);
-    await ensureAttached(tabId);
-    if (initScript) {
+    if (kind !== "url") {
+      // reload/back/forward 依赖 CDP，需要接管；type=url 走 tabs.update，可从占位页/chrome:// 页逃生
+      await ensureAttached(tabId);
+    }
+    if (initScript && kind !== "url") {
       await cdp(tabId, "Page.addScriptToEvaluateOnNewDocument", { source: initScript });
     }
     const before = await chrome.tabs.get(tabId);
@@ -258,6 +323,14 @@ export const methods: Record<Method, Handler> = {
       const url = str(params, "url");
       if (!url) throw new HostError("bad_request", "type=url 时必须提供 url");
       await chrome.tabs.update(tabId, { url });
+      if (initScript) {
+        try {
+          await ensureAttached(tabId);
+          await cdp(tabId, "Page.addScriptToEvaluateOnNewDocument", { source: initScript });
+        } catch {
+          // 占位页上注入失败可容忍：导航本身已生效
+        }
+      }
     } else if (kind === "reload") {
       await cdp(tabId, "Page.reload", { ignoreCache: bool(params, "ignoreCache", false) });
     } else if (kind === "back" || kind === "forward") {
@@ -280,10 +353,19 @@ export const methods: Record<Method, Handler> = {
   },
   // 获取截图
   async take_screenshot(params) {
+    debugLog(`screenshot enter ${JSON.stringify(params)}`);
     const tabId = await requireTab(params);
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    let tab = await chrome.tabs.get(tabId).catch(() => null);
+    debugLog(`screenshot tab ${tab?.id} active:${tab?.active} status:${tab?.status} win:${tab ? await chrome.windows.get(tab.windowId).then((w) => w.state).catch(() => "?") : "no-tab"}`);
     if (tab && (await chrome.windows.get(tab.windowId).catch(() => null))?.state === "minimized") {
       throw new HostError("window_minimized", "页面所在窗口已最小化，截图无法取得画面：请使窗口可见，或改用 take_snapshot 读取结构", true);
+    }
+    // 后台标签不出帧：先自动前台化再截
+    if (tab && tab.active === false && bool(params, "activate", true)) {
+      await chrome.tabs.update(tabId, { active: true });
+      await chrome.windows.update(tab.windowId, { focused: true }).catch(() => undefined);
+      tab = await chrome.tabs.get(tabId);
+      await settle(300);
     }
     const format = str(params, "format", "png") as string;
     const uid = str(params, "uid", null);
@@ -294,15 +376,35 @@ export const methods: Record<Method, Handler> = {
       clip = await boxRect(tabId, record.backendNodeId);
       if (!clip) throw new HostError("uid_not_found", `元素 ${uid} 无可见布局盒`, true);
     }
-    const base64 = await captureScreenshot(tabId, { format, quality: num(params, "quality", null), fullPage: bool(params, "fullPage", false), clip });
+    const options = { format, quality: num(params, "quality", null), fullPage: bool(params, "fullPage", false), clip };
+    let base64: string;
+    try {
+      // 常规路径：合成器取帧。窗口被遮挡时 Chrome 停止合成，此调用可能迟迟不返回
+      debugLog("screenshot surface try");
+      base64 = await captureScreenshot(tabId, { ...options, timeoutMs: 12_000 });
+      debugLog(`screenshot surface ok ${base64.length}`);
+    } catch (error) {
+      // 回退：直接向渲染器要最后一帧，不依赖合成器出帧（窗口被遮挡/失焦时仍可取得）
+      const first = error instanceof HostError ? error : new HostError("cdp_failed", error instanceof Error ? error.message : String(error));
+      debugLog(`screenshot surface failed: ${first.message}`);
+      try {
+        base64 = await captureScreenshot(tabId, { ...options, fromSurface: false, timeoutMs: 12_000 });
+        debugLog(`screenshot renderer ok ${base64.length}`);
+      } catch (error2) {
+        debugLog(`screenshot renderer failed: ${error2 instanceof Error ? error2.message : String(error2)}`);
+        throw new HostError(first.code, `${first.message}；回退 fromSurface=false 亦失败。若窗口被遮挡或最小化，请把浏览器窗口置于前台后重试`, true);
+      }
+    }
     const size = pngSize(base64);
+    debugLog("screenshot layout probe");
     const layout = await layoutInfo(tabId);
+    debugLog("screenshot done");
     if (size && layout.width === 0) {
       layout.width = Math.round(size.width / (layout.dpr || 1));
       layout.height = Math.round(size.height / (layout.dpr || 1));
     }
     return {
-      pageId: tabId, format, base64, bytes: Math.round((base64.length * 3) / 4), clip,
+      pageId: tabId, format, base64, bytes: Math.round((base64.length * 3) / 4), clip, activated: tab?.active === true,
       layout: { ...layout, screenshotWidth: size?.width ?? layout.screenshotWidth, screenshotHeight: size?.height ?? layout.screenshotHeight },
     };
   },
@@ -840,7 +942,7 @@ export const methods: Record<Method, Handler> = {
     const action = choice(params, "action", ["list", "get", "enable", "disable", "open_options"], "list");
     const selfId = chrome.runtime.id;
     const id = str(params, "extensionId", null);
-    if (action !== "list" && !id) throw new HostError("bad_request", `action=${action} 需要 downloadId；先 action=list 获取`);
+    if (action !== "list" && !id) throw new HostError("bad_request", `action=${action} 需要 extensionId；先 action=list 获取`);
     if (action === "list") {
       const all = await chrome.management.getAll();
       const rows = all
