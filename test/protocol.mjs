@@ -229,29 +229,23 @@ const COPIED = [
   "navigate_page",
   "take_snapshot",
   "take_screenshot",
-  "click",
-  "hover",
-  "drag",
-  "fill",
-  "press_key",
   "wait_for",
   "handle_dialog",
   "upload_file",
   "evaluate_script",
-  "list_network_requests",
-  "list_console_messages",
 ];
 check(
-  "内置那 16 个工具名逐个照抄",
+  "内置那 9 个工具名逐个照抄",
   COPIED.every((name) => names.includes(name)),
   COPIED.filter((name) => !names.includes(name)),
 );
 const METHODS = [...(/export type Method =([\s\S]*?);/.exec(SOURCE)?.[1] ?? "").matchAll(/"([a-z_]+)"/g)].map((match) => match[1]);
-const internal = METHODS.filter((name) => !names.includes(name));
+const SURFACE_ONLY = ["interact", "scripts", "logs", "debugger"];
+const HIDDEN = ["click", "hover", "drag", "fill", "press_key", "list_scripts", "read_script", "handle_breakpoints", "handle_pause", "list_network_requests", "list_console_messages"];
 check(
-  "工具表与 TS 方法表完全一致（status/detach 已注册为正式工具）",
-  internal.length === 0 && TOOLS.every((name) => names.includes(name)),
-  { internal, count: names.length, extra: names.filter((name) => !TOOLS.includes(name)) },
+  "MCP 工具面为方法表的收敛视图（合并 4 个、隐藏 11 个内部方法）",
+  SURFACE_ONLY.every((name) => names.includes(name)) && HIDDEN.every((name) => !names.includes(name)) && names.every((name) => SURFACE_ONLY.includes(name) || METHODS.includes(name)),
+  { missing: SURFACE_ONLY.filter((n) => !names.includes(n)), leaked: HIDDEN.filter((n) => names.includes(n)), unknown: names.filter((n) => !SURFACE_ONLY.includes(n) && !METHODS.includes(n)) },
 );
 
 const cold = await owner.call("list_pages", {});
@@ -274,7 +268,7 @@ if (!probed.out) {
 const [pyVersion, pyPort, pyId, pyTools] = JSON.parse(probed.out);
 check(
   "Python 与 src/protocol.ts 的常量一致",
-  pyVersion === PROTOCOL_VERSION && pyPort === DEFAULT_PORT && pyId === EXTENSION_ID && pyTools === TOOLS.length,
+  pyVersion === PROTOCOL_VERSION && pyPort === DEFAULT_PORT && pyId === EXTENSION_ID && pyTools === 27,
   { py: [pyVersion, pyPort, pyId, pyTools], ts: [PROTOCOL_VERSION, DEFAULT_PORT, EXTENSION_ID, TOOLS.length] },
 );
 
@@ -321,13 +315,13 @@ group("参数透传与错误码");
 const image = await owner.call("take_screenshot", { format: "png" });
 check("take_screenshot 内联返回 image 块", image.image?.data === PNG && image.image?.mimeType === "image/png", image.text);
 
-const clicked = await owner.call("click", { uid: "7_2", dblClick: true, includeSnapshot: true });
+const clicked = await owner.call("interact", { action: "click", uid: "7_2", dblClick: true, includeSnapshot: true });
 const clickParams = seen.find((entry) => entry.method === "click")?.params ?? {};
 check("click 原样透传 uid/dblClick/includeSnapshot", clickParams.uid === "7_2" && clickParams.dblClick === true && clickParams.includeSnapshot === true, clickParams);
-check("includeSnapshot 返回新快照", clicked.text.includes("已点击 7_2") && clicked.text.includes("[8_2] button"), clicked.text);
+check("includeSnapshot 返回新快照", clicked.text.includes("\"uid\": \"7_2\"") && clicked.text.includes("[8_2] button"), clicked.text);
 
 const scoped = await owner.call("take_screenshot", { format: "png", pageId: 43 });
-const drag = await owner.call("drag", { from_uid: "7_1", to_uid: "7_2", duration: 800 });
+const drag = await owner.call("interact", { action: "drag", uid: "7_1", to_uid: "7_2", duration: 800 });
 const shotParams = seen.find((entry) => entry.method === "take_screenshot" && entry.params?.pageId === 43)?.params ?? {};
 const dragParams = seen.find((entry) => entry.method === "drag")?.params ?? {};
 check(
@@ -336,7 +330,7 @@ check(
   { scoped: scoped.text.slice(0, 120), drag: drag.text.slice(0, 120) },
 );
 
-const rightClick = await owner.call("click", { uid: "7_2", button: "right" });
+const rightClick = await owner.call("interact", { action: "click", uid: "7_2", button: "right" });
 const rightParams = seen.filter((entry) => entry.method === "click").slice(-1)[0]?.params ?? {};
 check("button 透传右键点击", !rightClick.isError && rightParams.button === "right", { rightClick: rightClick.text.slice(0, 120), rightParams });
 
@@ -361,9 +355,9 @@ check(
   contextList.text,
 );
 
-const scriptList = await owner.call("list_scripts", { filter: "app" });
+const scriptList = await owner.call("scripts", { action: "list", filter: "app" });
 check("scripts 返回脚本索引", scriptList.text.includes("[7] 240 行 主帧 https://example.com/app.js"), scriptList.text);
-const source = await owner.call("read_script", { scriptId: "7" });
+const source = await owner.call("scripts", { action: "read", scriptId: "7" });
 check("script 返回源码正文", source.text.includes("var a = 2;") && source.text.includes("https://example.com/app.js"), source.text);
 
 const extensionList = await owner.call("manage_extensions", { action: "list" });
@@ -372,23 +366,23 @@ const extensionToggle = await owner.call("manage_extensions", { action: "disable
 const toggleParams = seen.filter((entry) => entry.method === "manage_extensions").slice(-1)[0]?.params ?? {};
 check("扩展开关动作原样下发并有回执", toggleParams.action === "disable" && extensionToggle.text.includes("停用"), { extensionToggle: extensionToggle.text, toggleParams });
 
-const bpList = await owner.call("handle_breakpoints", { action: "list" });
+const bpList = await owner.call("debugger", { action: "list" });
 check(
   "breakpoints 列表与暂停态一起排版",
   bpList.text.includes("[1:24:0:https://example.com/app.js] app.js:25:0") && bpList.text.includes("页面在跑"),
   bpList.text,
 );
-const bpAdd = await owner.call("handle_breakpoints", { action: "add", url: "https://example.com/app.js", line: 25, condition: "total > 40" });
+const bpAdd = await owner.call("debugger", { action: "add", url: "https://example.com/app.js", line: 25, condition: "total > 40" });
 const bpAddParams = seen.filter((entry) => entry.method === "handle_breakpoints").slice(-1)[0]?.params ?? {};
 check("断点参数原样下发", bpAddParams.line === 25 && bpAddParams.condition === "total > 40" && bpAdd.text.includes("→ 7:25"), { bpAdd: bpAdd.text, bpAddParams });
-const paused = await owner.call("handle_pause", { action: "state", function: "() => total" });
+const paused = await owner.call("debugger", { action: "state", function: "() => total" });
 check(
   "handle_pause 返回栈、变量与该帧求值结果",
   paused.text.includes("停在 DOM breakpoint") && paused.text.includes("computeTotal @ app.js:25") && paused.text.includes("total=45") && paused.text.includes("该帧求值: 45"),
   paused.text,
 );
-const resumed = await owner.call("handle_pause", { action: "step_over" });
-const exceptionHold = await owner.call("handle_pause", { action: "exceptions", exceptionState: "all" });
+const resumed = await owner.call("debugger", { action: "step_over" });
+const exceptionHold = await owner.call("debugger", { action: "exceptions", exceptionState: "all" });
 check("放行与异常暂停都有回执", resumed.text.includes("已 step_over") && exceptionHold.text.includes("设为 all"), { resumed: resumed.text, exceptionHold: exceptionHold.text });
 
 const intercepted = await owner.call("intercept_requests", { action: "add", match: "/api/data", ruleAction: "mock", status: 200, body: "{\"ok\":false}" });
@@ -431,16 +425,16 @@ check("bridge 改端口带重启提示", configWrite.text.includes("9100") && co
 const missing = await owner.call("upload_file", { uid: "7_1", filePath: "C:/does/not/exist.bin" });
 check("缺文件时返回 file_not_found 且不下发扩展", missing.isError && missing.text.includes("file_not_found") && !seen.some((entry) => entry.method === "upload_file"), missing.text);
 
-const stale = await owner.call("hover", { uid: "3_1" });
+const stale = await owner.call("interact", { action: "hover", uid: "3_1" });
 check("扩展侧错误码原样到达 MCP", stale.isError && stale.text.includes("stale_snapshot"), stale.text);
 
-const network = await owner.call("list_network_requests", { resourceTypes: ["xhr"] });
+const network = await owner.call("logs", { type: "network", resourceTypes: ["xhr"] });
 check("网络摘要含方法/状态/类型/耗时", /GET 200 xhr 1234B 340ms/.test(network.text), network.text);
 
-const consoleOut = await owner.call("list_console_messages", { types: ["log"] });
+const consoleOut = await owner.call("logs", { type: "console", types: ["log"] });
 check("控制台摘要含类型、world 与出处", consoleOut.text.includes("[log] content.js · 控制台标记 ALPHA · https://example.com/a.js:12"), consoleOut.text);
 
-const unknown = await owner.request("tools/call", { name: "click", arguments: {} });
+const unknown = await owner.request("tools/call", { name: "interact", arguments: { action: "click" } });
 check("缺 uid 时 MCP 层拒绝执行", /uid/.test(JSON.stringify(unknown.error ?? unknown.result ?? "")), unknown.error ?? unknown.result);
 
 group("第二个会话接入");
@@ -454,9 +448,9 @@ check(
 
 activity.maxConcurrent = 0;
 seen.length = 0;
-const [a, b] = await Promise.all([owner.call("fill", { uid: "7_1", value: "甲的内容" }), joiner.call("press_key", { key: "Control+A" })]);
+const [a, b] = await Promise.all([owner.call("interact", { action: "fill", uid: "7_1", value: "甲的内容" }), joiner.call("interact", { action: "press_key", key: "Control+A" })]);
 check("并发时扩展同一时刻只收到一条指令", activity.maxConcurrent === 1, activity);
-check("两个会话各自取回结果", a.text.includes("已填充 7_1（4 个字符）") && b.text.includes("已按下 Control+A"), { a: a.text, b: b.text });
+check("两个会话各自取回结果", a.text.includes("\"uid\": \"7_1\"") && a.text.includes("\"valueLength\": 4") && b.text.includes("\"key\": \"Control+A\""), { a: a.text, b: b.text });
 check("两条会话的请求均送达扩展", new Set(seen.map((entry) => entry.method)).size === 2, seen.map((entry) => entry.method));
 
 group("Origin 校验");

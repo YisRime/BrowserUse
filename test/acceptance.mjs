@@ -205,7 +205,7 @@ const owner = startMcp("owner", PORT);
 const init = await owner.hello();
 check("python stdio 即可完成 MCP 握手", Boolean(init.result?.serverInfo), init.result?.serverInfo ?? init);
 const toolList = await owner.request("tools/list", {});
-check("tools/list 返回 34 个工具", (toolList.result?.tools ?? []).length === 34, (toolList.result?.tools ?? []).map((tool) => tool.name));
+check("tools/list 返回 27 个工具", (toolList.result?.tools ?? []).length === 27, (toolList.result?.tools ?? []).map((tool) => tool.name));
 
 const browserProcess = track(
   spawn(
@@ -348,18 +348,18 @@ const snap = await owner.call("take_snapshot", {});
 check("take_snapshot 返回可交互元素 uid", uidIn(snap.text, "用户名") !== null && uidIn(snap.text, "提交") !== null, snap.text.slice(0, 600));
 
 const probeField = () => evalIn("() => { const el = document.getElementById('u'); return { value: el.value, start: el.selectionStart, end: el.selectionEnd, focused: document.activeElement === el }; }");
-await owner.call("fill", { uid: uidIn(snap.text, "用户名"), value: "夹具用户" });
+await owner.call("interact", { action: "fill", uid: uidIn(snap.text, "用户名"), value: "夹具用户" });
 const firstFill = await probeField();
-await owner.call("fill", { uid: uidIn(snap.text, "用户名"), value: "替换后的内容" });
+await owner.call("interact", { action: "fill", uid: uidIn(snap.text, "用户名"), value: "替换后的内容" });
 const secondFill = await probeField();
 check("fill 替换旧内容", secondFill.text.includes("替换后的内容") && !secondFill.text.includes("夹具用户"), { first: firstFill.text, second: secondFill.text });
-await owner.call("fill", { uid: uidIn(snap.text, "用户名"), value: "夹具用户" });
+await owner.call("interact", { action: "fill", uid: uidIn(snap.text, "用户名"), value: "夹具用户" });
 
-await owner.call("press_key", { key: "Tab" });
+await owner.call("interact", { action: "press_key", key: "Tab" });
 const focusAfterTab = await evalIn("() => document.activeElement?.id ?? null");
 check("press_key 派发按键移动焦点", focusAfterTab.text.includes("go"), focusAfterTab.text);
 
-const selectFill = await owner.call("fill", { uid: uidIn(snap.text, "系列"), value: "b" });
+const selectFill = await owner.call("interact", { action: "fill", uid: uidIn(snap.text, "系列"), value: "b" });
 const picked = await evalIn("() => document.getElementById('pick').textContent");
 check("fill 选中原生下拉并派发 change", picked.text.includes("已选 b"), { selectFill: selectFill.text.slice(0, 120), picked: picked.text });
 
@@ -371,7 +371,7 @@ const setWindowState = (state) => cdp("Browser.setWindowBounds", { windowId, bou
 
 await setWindowState("minimized");
 await delay(1_200);
-const clickRes = await owner.call("click", { uid: uidIn(snap.text, "提交") });
+const clickRes = await owner.call("interact", { action: "click", uid: uidIn(snap.text, "提交") });
 await until(20, async () => ((await evalIn("() => location.pathname")).text.includes("dashboard") ? true : null));
 
 const minimizedShot = await owner.call("take_screenshot", {});
@@ -420,9 +420,9 @@ const done = await until(20, async () => {
   return title.text.includes("接口已回") ? title : null;
 });
 check("夹具接口已完成", done !== null, done?.text);
-const network = await owner.call("list_network_requests", { resourceTypes: ["xhr", "fetch"] });
+const network = await owner.call("logs", { type: "network", resourceTypes: ["xhr", "fetch"] });
 check("list_network_requests 记录到真实 XHR", /\/api\/data/.test(network.text) && /200/.test(network.text), network.text);
-const consoleOut = await owner.call("list_console_messages", { types: ["log"] });
+const consoleOut = await owner.call("logs", { type: "console", types: ["log"] });
 check("list_console_messages 记录到 console 输出", consoleOut.text.includes("控制台标记 ALPHA"), consoleOut.text);
 
 group("上传与对话框");
@@ -475,14 +475,14 @@ const stay = await owner.call("navigate_page", { type: "url", url: `${FIXTURE}/i
 const stayed = await evalIn("() => location.pathname");
 check(
   "handleBeforeUnload=dismiss 留在原页且立刻返回",
-  !stay.isError && stay.text.includes("已取消（留在原页）") && stayed.text.includes("/dirty"),
+  !stay.isError && stay.text.includes("已取消") && stayed.text.includes("/dirty"),
   { stay: stay.text.slice(0, 200), stayed: stayed.text },
 );
 const leave = await owner.call("navigate_page", { type: "url", url: `${FIXTURE}/login`, handleBeforeUnload: "accept", timeout: 15_000 });
 const left = await evalIn("() => location.pathname");
 check(
   "handleBeforeUnload=accept 放行导航",
-  !leave.isError && leave.text.includes("已放行（离开页面）") && left.text.includes("/login"),
+  !leave.isError && leave.text.includes("已放行") && left.text.includes("/login"),
   { leave: leave.text.slice(0, 200), left: left.text },
 );
 
@@ -503,7 +503,7 @@ check("同一个探针在 main world 读不到", inMain.text.includes("返回值
 
 const worldLines = { last: "" };
 const worldError = await until(15, async () => {
-  const out = await owner.call("list_console_messages", {});
+  const out = await owner.call("logs", { type: "console",});
   worldLines.last = out.text;
   return out.text.includes("替身脚本报错样例") ? out : null;
 });
@@ -518,11 +518,11 @@ check(
   worldLines.last.slice(0, 500),
 );
 
-const guardScripts = await owner.call("list_scripts", { filter: String(guardId) });
+const guardScripts = await owner.call("scripts", { action: "list", filter: String(guardId) });
 check("scripts 按扩展 ID 过滤出注入的脚本", guardScripts.text.includes("content.js"), guardScripts.text.slice(0, 300));
-const guardSource = await owner.call("read_script", { url: `${guardId}/content.js` });
+const guardSource = await owner.call("scripts", { action: "read", url: `${guardId}/content.js` });
 check("script 取到用户脚本源码", guardSource.text.includes("__userscript_secret"), guardSource.text.slice(0, 300));
-const pageSource = await owner.call("read_script", { url: "/inspect" });
+const pageSource = await owner.call("scripts", { action: "read", url: "/inspect" });
 check("script 也可读取页面自身的内联脚本", pageSource.text.includes("onTargetClick") || pageSource.text.includes("addEventListener"), pageSource.text.slice(0, 300));
 
 const stopped = await owner.call("manage_extensions", { action: "disable", extensionId: String(guardId) });
@@ -554,18 +554,18 @@ function bridgeCall(method) {
 }
 
 await openPage("/bp", "断点夹具");
-const armed = await owner.call("handle_breakpoints", { action: "add", url: `${FIXTURE}/app.js`, line: 4 });
+const armed = await owner.call("debugger", { action: "add", url: `${FIXTURE}/app.js`, line: 4 });
 check("breakpoints add 返回落点", !armed.isError && armed.text.includes("断点已设"), armed.text.slice(0, 220));
 const armSnap = await owner.call("take_snapshot", {});
 const clickStarted = Date.now();
-const pausedClick = await owner.call("click", { uid: uidIn(armSnap.text, "算一次", "button") });
+const pausedClick = await owner.call("interact", { action: "click", uid: uidIn(armSnap.text, "算一次", "button") });
 const clickHeldMs = Date.now() - clickStarted;
 check(
   "命中断点的 click 立即返回 paused，不占队列",
   pausedClick.isError && pausedClick.text.includes("paused") && clickHeldMs < 4_000,
   { clickHeldMs, text: pausedClick.text.slice(0, 220) },
 );
-const pauseInfo = await owner.call("handle_pause", { action: "state", function: "() => total + items.length" });
+const pauseInfo = await owner.call("debugger", { action: "state", function: "() => total + items.length" });
 check(
   "pause 返回调用栈、局部变量与帧内求值",
   pauseInfo.text.includes("computeTotal @ app.js:4") && pauseInfo.text.includes("total=45") && pauseInfo.text.includes("该帧求值: 48"),
@@ -573,16 +573,16 @@ check(
 );
 const frozen = await owner.call("take_snapshot", {});
 check("暂停期间其它工具立即返回 paused", frozen.isError && frozen.text.includes("paused"), frozen.text.slice(0, 200));
-const released = await owner.call("handle_pause", { action: "resume" });
+const released = await owner.call("debugger", { action: "resume" });
 const ranOnce = await until(15, async () => (((await evalIn("() => window.__runs")).text.includes("1")) ? true : null));
 check(
   "continue 之后页面执行完剩余语句",
   !released.isError && released.text.includes("页面在跑") && ranOnce !== null,
   { released: released.text.slice(0, 160), runs: (await evalIn("() => window.__runs")).text },
 );
-await owner.call("handle_breakpoints", { action: "add", url: `${FIXTURE}/app.js`, line: 4 });
+await owner.call("debugger", { action: "add", url: `${FIXTURE}/app.js`, line: 4 });
 const secondSnap = await owner.call("take_snapshot", {});
-const pausedAgain = await owner.call("click", { uid: uidIn(secondSnap.text, "算一次", "button") });
+const pausedAgain = await owner.call("interact", { action: "click", uid: uidIn(secondSnap.text, "算一次", "button") });
 check("再次命中仍停在同一断点", pausedAgain.isError && pausedAgain.text.includes("paused"), pausedAgain.text.slice(0, 200));
 await bridgeCall("detach");
 const ranTwice = await until(15, async () => (((await evalIn("() => window.__runs")).text.includes("2")) ? true : null));
@@ -592,20 +592,20 @@ check(
   { runs: (await evalIn("() => window.__runs")).text, detached: await bridgeCall("detach") },
 );
 
-const listenerArm = await owner.call("handle_breakpoints", { action: "add_listener", eventName: "click" });
+const listenerArm = await owner.call("debugger", { action: "add_listener", eventName: "click" });
 check("事件名断点在这条通道上可设置", !listenerArm.isError && listenerArm.text.includes("click"), listenerArm.text.slice(0, 240));
 const clickSnapshot = await owner.call("take_snapshot", {});
-const pausedByListener = await owner.call("click", { uid: uidIn(clickSnapshot.text, "算一次", "button") });
+const pausedByListener = await owner.call("interact", { action: "click", uid: uidIn(clickSnapshot.text, "算一次", "button") });
 check(
   "事件断点在 dispatch 处把点击拦下",
   pausedByListener.isError && pausedByListener.text.includes("paused"),
   pausedByListener.text.slice(0, 240),
 );
-const listenerState = await owner.call("handle_pause", {});
+const listenerState = await owner.call("debugger", {});
 check("暂停原因来自事件监听", listenerState.text.includes("停在"), listenerState.text.slice(0, 300));
-await owner.call("handle_pause", { action: "resume" });
-const listenerOff = await owner.call("handle_breakpoints", { action: "remove_listener", eventName: "click" });
-const afterUnset = await owner.call("click", { uid: uidIn((await owner.call("take_snapshot", {})).text, "算一次", "button") });
+await owner.call("debugger", { action: "resume" });
+const listenerOff = await owner.call("debugger", { action: "remove_listener", eventName: "click" });
+const afterUnset = await owner.call("interact", { action: "click", uid: uidIn((await owner.call("take_snapshot", {})).text, "算一次", "button") });
 check("撤掉事件断点后点击照常通过", !listenerOff.isError && !afterUnset.isError, { listenerOff: listenerOff.text.slice(0, 160), afterUnset: afterUnset.text.slice(0, 160) });
 
 group("站点自身的 service worker");
@@ -647,7 +647,7 @@ const mocked = await owner.call("intercept_requests", { action: "add", match: "/
 check("拦截规则加上就生效并带自动停用倒计时", !mocked.isError && mocked.text.includes("mock") && /\d+s 后自动停用/.test(mocked.text), mocked.text);
 await openPage("/intercept", "拦截结果");
 const mockedLog = await until(20, async () => {
-  const out = await owner.call("list_console_messages", { types: ["log"] });
+  const out = await owner.call("logs", { type: "console", types: ["log"] });
   return out.text.includes("拦截结果") ? out : null;
 });
 const hitsAfterMock = await owner.call("intercept_requests", { action: "list" });
@@ -656,7 +656,7 @@ check("命中记录可取回", hitsAfterMock.text.includes("/api/intercepted") &
 await owner.call("intercept_requests", { action: "clear" });
 await openPage("/intercept", "拦截结果");
 const realLog = await until(20, async () => {
-  const out = await owner.call("list_console_messages", { types: ["log"] });
+  const out = await owner.call("logs", { type: "console", types: ["log"] });
   return out.text.includes("拦截结果 true") ? out : null;
 });
 check("撤掉拦截后同一请求读回真数据", realLog !== null, realLog?.text.slice(0, 300) ?? "仍读到 mock");
@@ -701,7 +701,7 @@ const downloadSession = swPage ? (await cdp("Target.attachToTarget", { targetId:
 if (downloadSession) await cdp("Page.setDownloadBehavior", { behavior: "allow", downloadPath: PROFILE }, downloadSession);
 await openPage("/download", "下载");
 const downloadUid = uidIn((await owner.call("take_snapshot", {})).text, "下载文件", "[a-z]+");
-await owner.call("click", { uid: downloadUid });
+await owner.call("interact", { action: "click", uid: downloadUid });
 const downloaded = await owner.call("handle_downloads", { action: "wait", match: "blob.csv", timeout: 15_000 });
 check("downloads wait 拿到本机路径", !downloaded.isError && downloaded.text.includes("blob.csv") && downloaded.text.includes("complete"), downloaded.text.slice(0, 300));
 const listed = await owner.call("handle_downloads", { action: "list" });
@@ -718,8 +718,8 @@ const rounds = [];
 for (let round = 0; round < 3; round += 1) {
   const fresh = await owner.call("take_snapshot", {});
   const field = uidIn(fresh.text, "用户名");
-  await owner.call("fill", { uid: field, value: "" });
-  const [ra, rb] = await Promise.all([owner.call("fill", { uid: field, value: valueA }), joiner.call("fill", { uid: field, value: valueB })]);
+  await owner.call("interact", { action: "fill", uid: field, value: "" });
+  const [ra, rb] = await Promise.all([owner.call("interact", { action: "fill", uid: field, value: valueA }), joiner.call("interact", { action: "fill", uid: field, value: valueB })]);
   const value = await evalIn("() => document.getElementById('u').value");
   rounds.push({ ok: !ra.isError && !rb.isError, value: value.text.replace(/^返回值: /, "") });
 }
@@ -730,10 +730,10 @@ group("失效事件");
 await openPage("/spa", "SPA 路由");
 const spaSnap = await owner.call("take_snapshot", {});
 const routeUid = uidIn(spaSnap.text, "换路由");
-const firstClick = await owner.call("click", { uid: routeUid });
+const firstClick = await owner.call("interact", { action: "click", uid: routeUid });
 check("pushState 前按钮可点击", !firstClick.isError, firstClick.text.slice(0, 200));
 const retired = await until(10, async () => {
-  const again = await owner.call("click", { uid: routeUid });
+  const again = await owner.call("interact", { action: "click", uid: routeUid });
   return again.isError && again.text.includes("stale_snapshot") ? again : null;
 });
 const sameDocument = owner.logs.find((line) => line.includes("navigated:same_document"));

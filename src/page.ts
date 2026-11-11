@@ -252,11 +252,26 @@ export const methods: Record<Method, Handler> = {
   },
   // 新建页面
   async create_page(params) {
-    const mode = choice(params, "mode", ["window", "tab"], "window");
+    const mode = choice(params, "mode", ["tab", "window"], "tab");
     const url = str(params, "url", "about:blank") as string;
+    if (bool(params, "reuse", true)) {
+      // 复用自动化专用页：不重复开标签页，导航到新 url 即可（tabs.update 还能顺带唤醒休眠/逃出占位页）
+      const got = await chrome.storage.session.get("browseruse.autoPage");
+      const stored = Number(got["browseruse.autoPage"]);
+      if (Number.isFinite(stored) && stored > 0) {
+        const tab = await chrome.tabs.get(stored).catch(() => null);
+        if (tab) {
+          await chrome.tabs.update(stored, { url, active: bool(params, "active", false) });
+          select(stored);
+          return { mode: "reuse", pageId: stored, windowId: tab.windowId, url, title: tab.title ?? "", focused: bool(params, "active", false) };
+        }
+        await chrome.storage.session.remove("browseruse.autoPage");
+      }
+    }
     if (mode === "tab") {
       const tab = await chrome.tabs.create({ url, active: bool(params, "active", false) });
       select(tab.id as number);
+      await chrome.storage.session.set({ "browseruse.autoPage": tab.id });
       return { mode, pageId: tab.id, windowId: tab.windowId, url: tab.url ?? url, title: tab.title ?? "", focused: bool(params, "active", false) };
     }
     // 普通浏览器新窗口（非 popup、非无痕），focused=false 时后台打开不抢焦点
@@ -274,6 +289,7 @@ export const methods: Record<Method, Handler> = {
     }
     if (!tab?.id) throw new HostError("cdp_failed", "窗口创建成功但未返回标签页", true);
     select(tab.id as number);
+    await chrome.storage.session.set({ "browseruse.autoPage": tab.id });
     return {
       mode, pageId: tab.id, windowId: win.id, url: tab.url ?? url, title: tab.title ?? "", focused: win.focused === true,
     };
@@ -286,6 +302,8 @@ export const methods: Record<Method, Handler> = {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) throw new HostError("page_gone", `页面 ${tabId} 已不存在，请重新 list_pages`, true);
     await chrome.tabs.remove(tabId);
+    const autoGot = (await chrome.storage.session.get("browseruse.autoPage").catch(() => ({}))) as Record<string, unknown>;
+    if (Number(autoGot["browseruse.autoPage"]) === tabId) await chrome.storage.session.remove("browseruse.autoPage").catch(() => undefined);
     return { closed: tabId, url: tab.url ?? "" };
   },
   // 列出标签
@@ -310,8 +328,10 @@ export const methods: Record<Method, Handler> = {
     const kind = choice(params, "type", ["url", "back", "forward", "reload"], "url");
     const timeoutMs = num(params, "timeout", 20_000) as number;
     const initScript = str(params, "initScript", null);
-    if (kind !== "url") {
-      // reload/back/forward 依赖 CDP，需要接管；type=url 走 tabs.update，可从占位页/chrome:// 页逃生
+    const currentUrl = (await chrome.tabs.get(tabId).catch(() => ({ url: "" })))?.url ?? "";
+    const escaped = /^(chrome-extension|chrome|edge|devtools|view-source|about):/.test(currentUrl.replace(/^about:blank([?#]|$)/, "about:blank$1")) && currentUrl.startsWith("about:") === false || currentUrl.startsWith("chrome-extension://") || /^(chrome|edge|devtools|view-source):/.test(currentUrl) || /^about:(?!blank)/.test(currentUrl);
+    if (kind !== "url" || !escaped) {
+      // 占位页/chrome:// 页上无法接管：仅此时跳过（type=url 走 tabs.update 逃生）；其余先接管以监听 beforeunload
       await ensureAttached(tabId);
     }
     if (initScript && kind !== "url") {
